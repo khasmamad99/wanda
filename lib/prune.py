@@ -146,7 +146,11 @@ def prepare_groupwise_pruning_mask(
 
 
 def prepare_groupwise_pruning_mask_faster(
-    pruning_metric: torch.Tensor, group_size: int = 8, split_channel_dim: int = 0, sparsity_ratio: float = 0.5
+    pruning_metric: torch.Tensor, 
+    group_size: int = 8, 
+    split_channel_dim: int = 0, 
+    sparsity_ratio: float = 0.5,
+    comparison_group_num_channels: int = 1,
 ) -> torch.Tensor:
     """Prepare groupwise pruning mask based on the given pruning metric.
 
@@ -164,6 +168,9 @@ def prepare_groupwise_pruning_mask_faster(
         Dimension along which to group the weights and prune them.
     sparsity_ratio
         Sparsity ratio to be achieved by pruning.
+    comparison_group_num_channels
+        The number of split channels to use as the comparison group. Each comparison group gets a
+        separate pruning threshold.
 
     Returns
     -------
@@ -172,7 +179,14 @@ def prepare_groupwise_pruning_mask_faster(
     """
     assert sparsity_ratio > 0.0 and sparsity_ratio < 1.0, "Sparsity ratio should be in the range (0, 1)."
     assert pruning_metric.dim() == 2, "`pruning_metric` should be a 2D matrix."
-
+    
+    num_split_channels = pruning_metric.size(split_channel_dim)
+    assert num_split_channels % comparison_group_num_channels == 0, (
+        f"The number of split channels {num_split_channels} should be divisible by "
+        f"the comparison group size {comparison_group_num_channels}."
+    )
+    num_comparison_groups = num_split_channels // comparison_group_num_channels
+    
     group_channel_dim = 1 - split_channel_dim
     group_channel_numel = pruning_metric.size(dim=group_channel_dim)
 
@@ -187,13 +201,17 @@ def prepare_groupwise_pruning_mask_faster(
     )
 
     group_sums = unfolded_padded_pruning_metric.sum(dim=-1)
-    num_groups = math.ceil(group_channel_numel / group_size)
+    group_sums_comparison_grouped_shape = (num_comparison_groups, -1) if split_channel_dim == 0 else (-1, num_comparison_groups)
+    group_sums_comparison_grouped = group_sums.reshape(group_sums_comparison_grouped_shape)
+    
+    num_groups = math.ceil(group_channel_numel / group_size) * comparison_group_num_channels
     num_groups_to_prune = int(sparsity_ratio * num_groups)
     pruning_threshold = torch.kthvalue(
-        input=group_sums, k=num_groups_to_prune, dim=group_channel_dim, keepdim=True
+        input=group_sums_comparison_grouped, k=num_groups_to_prune, dim=group_channel_dim, keepdim=True
     ).values
 
-    pruning_mask = group_sums <= pruning_threshold
+    pruning_mask = group_sums_comparison_grouped <= pruning_threshold
+    pruning_mask = pruning_mask.reshape(group_sums.shape)
     pruning_mask = pruning_mask.unsqueeze(group_channel_dim + 1)
     pruning_mask = pruning_mask.repeat_interleave(repeats=group_size, dim=group_channel_dim + 1)
     pruning_mask = pruning_mask.reshape(padded_shape)
