@@ -5,7 +5,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune_opt import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
+from lib.prune_opt import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_relative_importance
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -33,12 +33,14 @@ def main():
     parser.add_argument('--sparsity_ratios', type=float, nargs="+", help='Sparsity ratios')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4", "groupwise"])
     parser.add_argument("--group_sizes", nargs="+", type=int, default=[0], help="group sizes for groupwise sparsity")
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
+    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "relative_importance",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
+    parser.add_argument('--eval_dense', action="store_true", help="whether to evaluate the dense model.")
+    parser.add_argument('--eval_dense_only', action="store_true", help="whether to evaluate the dense model only.")
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -46,6 +48,23 @@ def main():
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
+    
+    results = {}
+    if args.eval_dense:
+        print("Evaluating dense model")
+        model = get_llm(args.model, args.cache_dir)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+        device = torch.device("cuda:0")
+        if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+            device = model.hf_device_map["lm_head"]
+        print("use device ", device)
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"dense wikitext perplexity {ppl_test}")
+        results["dense"] = ppl_test
+        if args.eval_dense_only:
+            return
 
     assert len(args.sparsity_ratios) > 0, "sparsity ratio must be provided"
     assert all([sparsity_ratio > 0 and sparsity_ratio < 1 for sparsity_ratio in args.sparsity_ratios]), "sparsity ratio must be greater than 0"
@@ -65,10 +84,8 @@ def main():
     
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
-
     
     print("pruning starts")
-    results = {}
     for sparsity_ratio in args.sparsity_ratios:
         args.sparsity_ratio = sparsity_ratio
         print(f"pruning with sparsity ratio {sparsity_ratio:.4f}")
@@ -93,6 +110,8 @@ def main():
                 prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
             elif args.prune_method == "sparsegpt":
                 prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+            elif args.prune_method == "relative_importance":
+                prune_relative_importance(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
             elif "ablate" in args.prune_method:
                 assert args.group_size == 0, "groupwise sparsity not supported for ablate"
                 prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
@@ -119,6 +138,9 @@ def main():
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
         print("method\tsparsity_type\tsparsity_ratio\tppl_test", file=f, flush=True)
+        if "dense" in results:
+            dense_ppl_test = results.pop("dense")
+            print(f"dense\t-\t-\t{dense_ppl_test:.4f}", file=f, flush=True)
         for sparsity_ratio, results_per_group in results.items():
             for group_size, ppl_test in results_per_group.items():
                 if args.sparsity_type == "groupwise":
