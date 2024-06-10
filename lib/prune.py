@@ -170,7 +170,7 @@ def prepare_groupwise_pruning_mask_faster(
         Sparsity ratio to be achieved by pruning.
     comparison_group_num_channels
         The number of split channels to use as the comparison group. Each comparison group gets a
-        separate pruning threshold.
+        separate pruning threshold. If -1, the entire pruning metric is used as a single comparison.
 
     Returns
     -------
@@ -181,6 +181,8 @@ def prepare_groupwise_pruning_mask_faster(
     assert pruning_metric.dim() == 2, "`pruning_metric` should be a 2D matrix."
     
     num_split_channels = pruning_metric.size(split_channel_dim)
+    if comparison_group_num_channels == -1:
+        comparison_group_num_channels = num_split_channels
     assert num_split_channels % comparison_group_num_channels == 0, (
         f"The number of split channels {num_split_channels} should be divisible by "
         f"the comparison group size {comparison_group_num_channels}."
@@ -247,7 +249,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size: int = 0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size: int = 0, relative_importance: bool = False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
