@@ -1,5 +1,6 @@
 import time 
 import heapq 
+import math
 import torch 
 import torch.nn as nn 
 from .sparsegpt import SparseGPT 
@@ -102,7 +103,127 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     cur_sparsity = (W_mask==True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
 
-def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+
+def prepare_groupwise_pruning_mask(
+    pruning_metric: torch.Tensor, group_size: int = 8, dim: int = 0, sparsity_ratio: float = 0.5
+) -> torch.Tensor:
+    """Prepare groupwise pruning mask based on the given pruning metric.
+
+    Parameters
+    ----------
+    pruning_metric
+        Pruning metric to be used for groupwise pruning. The shape of the tensor should be
+        (output_channels, input_channels). It is expected to match the size of the weight tensor.
+    group_size
+        Size of the group to be pruned.
+    dim
+        Dimension along which to group the weights and prune them.
+    sparsity_ratio
+        Sparsity ratio to be achieved by pruning.
+
+    Returns
+    -------
+    Pruning mask with the same shape as `pruning_metric` where an element is set to `True` if
+    the corresponding weight is to be pruned.
+    """
+    assert sparsity_ratio > 0.0 and sparsity_ratio < 1.0, "Sparsity ratio should be in the range (0, 1)."
+
+    pruning_mask = torch.zeros_like(pruning_metric, dtype=torch.bool)
+    for channel_idx in range(pruning_metric.size(dim)):
+        channel = pruning_metric.select(dim=dim, index=channel_idx)
+        groups_in_channel: tuple[torch.Tensor, ...] = channel.split(split_size=group_size)
+
+        num_groups_to_prune = int(sparsity_ratio * len(groups_in_channel))
+        group_sums = torch.tensor([group.sum() for group in groups_in_channel])
+        indices_of_groups_to_prune = torch.argsort(group_sums)[:num_groups_to_prune]
+
+        for group_idx in indices_of_groups_to_prune:
+            pruning_mask.select(dim=dim, index=channel_idx)[
+                group_idx * group_size : group_idx * group_size + group_size
+            ].fill_(True)
+
+    return pruning_mask
+
+
+def prepare_groupwise_pruning_mask_faster(
+    pruning_metric: torch.Tensor, 
+    group_size: int = 8, 
+    split_channel_dim: int = 0, 
+    sparsity_ratio: float = 0.5,
+    comparison_group_num_channels: int = 1,
+) -> torch.Tensor:
+    """Prepare groupwise pruning mask based on the given pruning metric.
+
+    The pruning_metric is split across the `split_channel_dim` and each channel is divided into groups of
+    size `group_size`. Then, `sparsity_ratio` ratio of groups with the lowest sum are pruned.
+
+    Parameters
+    ----------
+    pruning_metric
+        Pruning metric to be used for groupwise pruning. The shape of the tensor should be
+        (output_channels, input_channels). It is expected to match the size of the weight tensor.
+    group_size
+        Size of the group to be pruned.
+    split_channel_dim
+        Dimension along which to group the weights and prune them.
+    sparsity_ratio
+        Sparsity ratio to be achieved by pruning.
+    comparison_group_num_channels
+        The number of split channels to use as the comparison group. Each comparison group gets a
+        separate pruning threshold. If -1, the entire pruning metric is used as a single comparison.
+
+    Returns
+    -------
+    Pruning mask with the same shape as `pruning_metric` where an element is set to `True` if
+    the corresponding weight is to be pruned.
+    """
+    assert sparsity_ratio > 0.0 and sparsity_ratio < 1.0, "Sparsity ratio should be in the range (0, 1)."
+    assert pruning_metric.dim() == 2, "`pruning_metric` should be a 2D matrix."
+    
+    num_split_channels = pruning_metric.size(split_channel_dim)
+    if comparison_group_num_channels == -1:
+        comparison_group_num_channels = num_split_channels
+    assert num_split_channels % comparison_group_num_channels == 0, (
+        f"The number of split channels {num_split_channels} should be divisible by "
+        f"the comparison group size {comparison_group_num_channels}."
+    )
+    num_comparison_groups = num_split_channels // comparison_group_num_channels
+    
+    group_channel_dim = 1 - split_channel_dim
+    group_channel_numel = pruning_metric.size(dim=group_channel_dim)
+
+    pad_value = -group_channel_numel % group_size
+    pad = [0, 0, 0, 0]
+    pad[split_channel_dim * 2 + 1] = pad_value
+    padded_pruning_metric = torch.nn.functional.pad(pruning_metric, pad=pad, mode="constant", value=0.0)
+    padded_shape = padded_pruning_metric.shape
+
+    unfolded_padded_pruning_metric = padded_pruning_metric.unfold(
+        dimension=group_channel_dim, size=group_size, step=group_size
+    )
+
+    group_sums = unfolded_padded_pruning_metric.sum(dim=-1)
+    group_sums_comparison_grouped_shape = (num_comparison_groups, -1) if split_channel_dim == 0 else (-1, num_comparison_groups)
+    group_sums_comparison_grouped = group_sums.reshape(group_sums_comparison_grouped_shape)
+    
+    num_groups = math.ceil(group_channel_numel / group_size) * comparison_group_num_channels
+    num_groups_to_prune = int(sparsity_ratio * num_groups)
+    pruning_threshold = torch.kthvalue(
+        input=group_sums_comparison_grouped, k=num_groups_to_prune, dim=group_channel_dim, keepdim=True
+    ).values
+
+    pruning_mask = group_sums_comparison_grouped <= pruning_threshold
+    pruning_mask = pruning_mask.reshape(group_sums.shape)
+    pruning_mask = pruning_mask.unsqueeze(group_channel_dim + 1)
+    pruning_mask = pruning_mask.repeat_interleave(repeats=group_size, dim=group_channel_dim + 1)
+    pruning_mask = pruning_mask.reshape(padded_shape)
+    pruning_mask = pruning_mask.narrow(dim=group_channel_dim, start=0, length=group_channel_numel)
+
+    return pruning_mask
+
+
+
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size: int = 0):
     layers = model.model.layers 
 
     for i in range(len(layers)):
@@ -113,18 +234,22 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
             W = subset[name].weight.data 
             W_metric = torch.abs(W)
             if prune_n != 0:
+                assert prune_m > prune_n, "prune_m should be greater than prune_n"
+                assert group_size == 0, "groupwise pruning not supported for n:m sparsity"
                 W_mask = (torch.zeros_like(W)==1)
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            elif group_size > 0:
+                W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
             else:
                 thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
                 W_mask = (W_metric<=thresh)
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size: int = 0, relative_importance: bool = False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -168,10 +293,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
                 # structured n:m sparsity
+                assert prune_m > prune_n, "prune_m should be greater than prune_n"
+                assert group_size == 0, "groupwise pruning not supported for n:m sparsity"
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            elif group_size > 0:
+                W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
             else:
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
@@ -211,7 +340,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
 
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
+def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, group_size: int = 0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
@@ -285,7 +414,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             print(i, name)
             print('Pruning ...')
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128, group_size=group_size)
             gpts[name].free()
 
         for j in range(args.nsamples):

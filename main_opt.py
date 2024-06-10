@@ -5,7 +5,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune_opt import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
+from lib.prune_opt import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_relative_importance
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -30,14 +30,17 @@ def main():
     parser.add_argument('--model', type=str, help='LLaMA model')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
-    parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
-    parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
+    parser.add_argument('--sparsity_ratios', type=float, nargs="+", help='Sparsity ratios')
+    parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4", "groupwise"])
+    parser.add_argument("--group_sizes", nargs="+", type=int, default=[0], help="group sizes for groupwise sparsity")
+    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "relative_importance",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
+    parser.add_argument('--eval_dense', action="store_true", help="whether to evaluate the dense model.")
+    parser.add_argument('--eval_dense_only', action="store_true", help="whether to evaluate the dense model only.")
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -45,50 +48,106 @@ def main():
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
+    
+    results = {}
+    if args.eval_dense:
+        print("Evaluating dense model")
+        model = get_llm(args.model, args.cache_dir)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+        device = torch.device("cuda:0")
+        if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+            device = model.hf_device_map["lm_head"]
+        print("use device ", device)
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"dense wikitext perplexity {ppl_test}")
+        results["dense"] = ppl_test
+        if args.eval_dense_only:
+            return
+
+    assert len(args.sparsity_ratios) > 0, "sparsity ratio must be provided"
+    assert all([sparsity_ratio > 0 and sparsity_ratio < 1 for sparsity_ratio in args.sparsity_ratios]), "sparsity ratio must be greater than 0"
 
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
-    if args.sparsity_type != "unstructured":
-        assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+    if args.sparsity_type == "unstructured":
+        args.group_sizes = [0]
+    elif args.sparsity_type != "unstructured" and args.sparsity_type != "groupwise":
+        print("N:M sparsity is selected. Setting sparsity ratio to 0.5 for structured N:M sparsity")
+        args.sparsity_ratios = [0.5]
+        args.group_sizes = [0]
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
-
+    elif args.sparsity_type == "groupwise":
+        assert all([group_size > 0 for group_size in args.group_sizes]), "group size must be greater than 0 for groupwise sparsity"
+        print(f"Using groupwise pruning with group sizes of {args.group_sizes}")
+    
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
-    model = get_llm(args.model, args.cache_dir)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    
+    print("pruning starts")
+    for sparsity_ratio in args.sparsity_ratios:
+        args.sparsity_ratio = sparsity_ratio
+        print(f"pruning with sparsity ratio {sparsity_ratio:.4f}")
+        results_per_group = {}
+        for group_size in args.group_sizes:
+            args.group_size = group_size
+            if args.sparsity_type == "groupwise":
+                print(f"pruning with group size {group_size}")
+        
+            model = get_llm(args.model, args.cache_dir)
+            model.eval()
+            tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-    device = torch.device("cuda:0")
-    if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
-        device = model.hf_device_map["lm_head"]
-    print("use device ", device)
+            device = torch.device("cuda:0")
+            if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+                device = model.hf_device_map["lm_head"]
+            print("use device ", device)
+            
+            if args.prune_method == "wanda":
+                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+            elif args.prune_method == "magnitude":
+                prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+            elif args.prune_method == "sparsegpt":
+                prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+            elif args.prune_method == "relative_importance":
+                prune_relative_importance(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+            elif "ablate" in args.prune_method:
+                assert args.group_size == 0, "groupwise sparsity not supported for ablate"
+                prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
-    if args.sparsity_ratio != 0:
-        print("pruning starts")
-        if args.prune_method == "wanda":
-            prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "magnitude":
-            prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "sparsegpt":
-            prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif "ablate" in args.prune_method:
-            prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-
-    ################################################################
-    print("*"*30)
-    sparsity_ratio = check_sparsity(model)
-    print(f"sparsity sanity check {sparsity_ratio:.4f}")
-    print("*"*30)
-    ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+            ################################################################
+            print("*"*30)
+            actual_sparsity_ratio = check_sparsity(model)
+            print(f"sparsity sanity check {actual_sparsity_ratio:.4f}")
+            print("*"*30)
+            ################################################################
+            ppl_test = eval_ppl(args, model, tokenizer, device)
+            print(f"wikitext perplexity {ppl_test}")
+            
+            results_per_group[group_size] = ppl_test
+            
+            if args.save_model:
+                model.save_pretrained(args.save_model)
+                tokenizer.save_pretrained(args.save_model)
+                
+        results[sparsity_ratio] = results_per_group
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
-        print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        print("method\tsparsity_type\tsparsity_ratio\tppl_test", file=f, flush=True)
+        if "dense" in results:
+            dense_ppl_test = results.pop("dense")
+            print(f"dense\t-\t-\t{dense_ppl_test:.4f}", file=f, flush=True)
+        for sparsity_ratio, results_per_group in results.items():
+            for group_size, ppl_test in results_per_group.items():
+                if args.sparsity_type == "groupwise":
+                    sparsity_type = f"groupwise({group_size})"
+                else:
+                    sparsity_type = args.sparsity_type
+                print(f"{args.prune_method}\t{sparsity_type}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False
@@ -102,9 +161,7 @@ def main():
         print("zero_shot evaluation results")
         print(results)
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+
 
 if __name__ == '__main__':
     main()
