@@ -2,3 +2,8 @@
 .env
 *.pyc
 *.DS_Store
+
+.vscode/
+llm_weights/
+results/
+scratch/
