@@ -6,7 +6,7 @@ from .sparsegpt import SparseGPT
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 from .prune import prepare_groupwise_pruning_mask, prepare_groupwise_pruning_mask_faster
-
+from .channel_permutation import calculate_heuristic_channel_permutation, register_input_channel_permutation_hook
 from .ablate import AblateGPT 
 
 def find_layers(module, layers=[nn.Linear], name=''):
@@ -29,6 +29,8 @@ def find_layers(module, layers=[nn.Linear], name=''):
             child, layers=layers, name=name + '.' + name1 if name != '' else name1
         ))
     return res
+    
+
 
 def check_sparsity(model):
     use_cache = model.config.use_cache 
@@ -100,7 +102,7 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     cur_sparsity = (W_mask==True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
 
-def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0):
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0, apply_channel_permutation: bool = False):
     layers = model.model.decoder.layers 
 
     for i in range(len(layers)):
@@ -110,7 +112,15 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
         for name in subset:
             W = subset[name].weight.data 
             W_metric = torch.abs(W)
+            
+            if apply_channel_permutation:
+                channel_permutation = calculate_heuristic_channel_permutation(W_metric)
+                assert len(channel_permutation) == subset[name].weight.data.shape[1]
+                W_metric = W_metric[:, channel_permutation]
+                assert W_metric.shape == subset[name].weight.data.shape
+            
             if prune_n != 0:
+                assert not apply_channel_permutation, "Channel Permutation is not supported for n:m sparsity"
                 assert prune_m > prune_n, "prune_m must be greater than prune_n"
                 assert group_size == 0, "group_size must be 0 for n:m sparsity"
                 W_mask = (torch.zeros_like(W)==1)
@@ -121,13 +131,18 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
             elif group_size > 0:
                 W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
             else:
+                assert not apply_channel_permutation, "Channel Permutation does not make sense for unstructured sparsity"
                 thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
                 W_mask = (W_metric<=thresh)
 
-            W[W_mask] = 0
+            if apply_channel_permutation:
+                register_input_channel_permutation_hook(subset[name], channel_permutation)
+                subset[name].weight.data = subset[name].weight.data[:, channel_permutation]
+                
+            subset[name].weight.data[W_mask] = 0
             
 
-def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0):
+def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0, apply_channel_permutation: bool = False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -172,10 +187,17 @@ def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:
             col_wise_sums = W_abs.sum(dim=0, keepdim=True)
             W_col_wise_normalized = W_abs / col_wise_sums
             W_metric = (W_row_wise_normalized + W_col_wise_normalized) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1))).pow(0.5)
+            
+            if apply_channel_permutation:
+                channel_permutation = calculate_heuristic_channel_permutation(W_metric)
+                assert len(channel_permutation) == subset[name].weight.data.shape[1]
+                W_metric = W_metric[:, channel_permutation]
+                assert W_metric.shape == subset[name].weight.data.shape
 
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
                 # structured n:m sparsity
+                assert not apply_channel_permutation, "Channel Permutation is not supported for n:m sparsity"
                 assert prune_m > prune_n, "prune_m must be greater than prune_n"
                 assert group_size == 0, "group_size must be 0 for n:m sparsity"
                 for ii in range(W_metric.shape[1]):
@@ -190,6 +212,7 @@ def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:
                     comparison_group_num_channels=-1,
                 )
             else:
+                assert not apply_channel_permutation, "Channel Permutation does not make sense for unstructured sparsity"
                 pruning_threshold = torch.kthvalue(
                     input=W_metric.flatten(), k=int(W_mask.numel() * args.sparsity_ratio)
                 ).values
@@ -197,6 +220,10 @@ def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:
                 # unstructured pruning
                 W_mask = W_metric <= pruning_threshold
 
+            if apply_channel_permutation:
+                register_input_channel_permutation_hook(subset[name], channel_permutation)
+                subset[name].weight.data = subset[name].weight.data[:, channel_permutation]
+            
             subset[name].weight.data[W_mask] = 0  ## set weights to zero 
 
         for j in range(args.nsamples):
@@ -209,7 +236,7 @@ def prune_relative_importance(args, model, tokenizer, device=torch.device("cuda:
 
 
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0, apply_channel_permutation: bool = False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -249,10 +276,18 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         for name in subset:
             print(f"pruning layer {i} name {name}")
             W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            
+            if apply_channel_permutation:
+                channel_permutation = calculate_heuristic_channel_permutation(W_metric)
+                assert len(channel_permutation) == subset[name].weight.data.shape[1]
+                W_metric = W_metric[:, channel_permutation]
+                assert W_metric.shape == subset[name].weight.data.shape
+
 
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
                 # structured n:m sparsity
+                assert not apply_channel_permutation, "channel_permutation is not supported for n:m sparsity"
                 assert prune_m > prune_n, "prune_m must be greater than prune_n"
                 assert group_size == 0, "group_size must be 0 for n:m sparsity"
                 for ii in range(W_metric.shape[1]):
@@ -261,14 +296,22 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             elif group_size > 0:
                 W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
+                assert W_mask.shape == W_metric.shape
+                assert W_mask.shape == subset[name].weight.data.shape
             else:
+                assert not apply_channel_permutation, "Channel Permutation does not make sense for unstructured sparsity"
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
                 # unstructured pruning
                 indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                 W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            if apply_channel_permutation:
+                register_input_channel_permutation_hook(subset[name], channel_permutation)
+                subset[name].weight.data = subset[name].weight.data[:, channel_permutation]
+                
+            subset[name].weight.data[W_mask] = 0  # set weights to zero
+             
 
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -279,7 +322,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     torch.cuda.empty_cache()
 
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, group_size=0):
+def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, group_size=0, apply_channel_permutation: bool = False):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
@@ -352,8 +395,19 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, group_siz
             print(i, name)
             print('Pruning ...')
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128, group_size=group_size)
+            channel_permutation = gpts[name].fasterprune(
+                args.sparsity_ratio, 
+                prune_n=prune_n, 
+                prune_m=prune_m, 
+                percdamp=0.01, 
+                blocksize=128, 
+                group_size=group_size, 
+                apply_channel_permutation=apply_channel_permutation
+            )
             gpts[name].free()
+            if apply_channel_permutation:
+                register_input_channel_permutation_hook(subset[name], channel_permutation)
+            
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]

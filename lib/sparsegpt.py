@@ -6,6 +6,8 @@ import torch.nn.functional
 import torch.nn as nn
 import transformers
 
+from .channel_permutation import calculate_heuristic_channel_permutation
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -40,7 +42,7 @@ class SparseGPT:
         self.H += inp.matmul(inp.t())
 
     def fasterprune(
-        self, sparsity, prune_n=0, prune_m=0, blocksize=128, percdamp=.01, group_size=0,
+        self, sparsity, prune_n=0, prune_m=0, blocksize=128, percdamp=.01, group_size=0, apply_channel_permutation: bool = False
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -65,7 +67,10 @@ class SparseGPT:
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
-
+        
+        if apply_channel_permutation:
+            channel_permutation_list = []
+            
         mask = None
 
         for i1 in range(0, self.columns, blocksize):
@@ -84,9 +89,19 @@ class SparseGPT:
                 else:
                     tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
                     if group_size == 0:
+                        assert not apply_channel_permutation, "Channel Permutation does not make sense for unstructured pruning."
                         thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
                         mask1 = tmp <= thresh
                     else:
+                        if apply_channel_permutation:
+                            channel_permutation = calculate_heuristic_channel_permutation(tmp)
+                            channel_permutation_list.append(channel_permutation + i1)
+                            tmp = tmp[:, channel_permutation]
+                            W1 = W1[:, channel_permutation]
+                            Hinv1 = Hinv1[channel_permutation][:, channel_permutation]
+                            W[:, i1:i2] = W1
+                            Hinv[i1:i2, i1:i2] = Hinv1
+                        
                         padding_value = -tmp.shape[1] % group_size
                         padded_tmp = torch.nn.functional.pad(tmp, pad=(0, 0, 0, padding_value), mode="constant", value=0.)
                         unfolded_tmp = padded_tmp.unfold(1, group_size, group_size) # -> (output_channels, num_groups, group_size)
@@ -101,6 +116,7 @@ class SparseGPT:
                         mask1 = mask1.narrow(dim=1, start=0, length=tmp.shape[1])
                     
             else:
+                assert not apply_channel_permutation, "Channel Permutation is not supported for n:m pruning."
                 mask1 = torch.zeros_like(W1) == 1
 
             for i in range(count):
@@ -134,6 +150,9 @@ class SparseGPT:
         #     # change from input to output
         #     W = W.T
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if apply_channel_permutation:
+            return torch.cat(channel_permutation_list)
+        
 
     def free(self):
         self.H = None

@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--group_sizes", nargs="+", type=int, default=[0], help="group sizes for groupwise sparsity")
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "relative_importance",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
+    parser.add_argument("--apply_channel_permutation", action="store_true", help="whether to apply channel permutation")
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -72,8 +73,10 @@ def main():
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
     if args.sparsity_type == "unstructured":
+        assert not args.apply_channel_permutation, "channel permutation does not make sense for unstructured sparsity"
         args.group_sizes = [0]
     elif args.sparsity_type != "unstructured" and args.sparsity_type != "groupwise":
+        assert not args.apply_channel_permutation, "channel permutation is not supported for n:m sparsity"
         print("N:M sparsity is selected. Setting sparsity ratio to 0.5 for structured N:M sparsity")
         args.sparsity_ratios = [0.5]
         args.group_sizes = [0]
@@ -81,6 +84,8 @@ def main():
     elif args.sparsity_type == "groupwise":
         assert all([group_size > 0 for group_size in args.group_sizes]), "group size must be greater than 0 for groupwise sparsity"
         print(f"Using groupwise pruning with group sizes of {args.group_sizes}")
+        if args.apply_channel_permutation:
+            print("channel permutation will be applied")
     
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
@@ -105,13 +110,13 @@ def main():
             print("use device ", device)
             
             if args.prune_method == "wanda":
-                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size, apply_channel_permutation=args.apply_channel_permutation)
             elif args.prune_method == "magnitude":
-                prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+                prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size, apply_channel_permutation=args.apply_channel_permutation)
             elif args.prune_method == "sparsegpt":
-                prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+                prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size, apply_channel_permutation=args.apply_channel_permutation)
             elif args.prune_method == "relative_importance":
-                prune_relative_importance(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size)
+                prune_relative_importance(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, group_size=args.group_size, apply_channel_permutation=args.apply_channel_permutation)
             elif "ablate" in args.prune_method:
                 assert args.group_size == 0, "groupwise sparsity not supported for ablate"
                 prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
