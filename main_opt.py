@@ -52,21 +52,23 @@ def main():
         assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
 
-    model_name = args.model.split("/")[-1]
-    print(f"loading llm model {args.model}")
-    model = get_llm(args.model, args.cache_dir)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-
-    device = torch.device("cuda:0")
-    if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
-        device = model.hf_device_map["lm_head"]
-    print("use device ", device)
-
     sparsity_ratio_to_perplexity = {}
     if len(args.sparsity_ratios) > 0:
         print("pruning starts")
         for sparsity_ratio in args.sparsity_ratios:
+            
+            model_name = args.model.split("/")[-1]
+            print(f"loading llm model {args.model}")
+            model = get_llm(args.model, args.cache_dir)
+            model.eval()
+            tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+            device = torch.device("cuda:0")
+            if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+                device = model.hf_device_map["lm_head"]
+            print("use device ", device)
+            
+            
             args.sparsity_ratio = sparsity_ratio
             print(f"pruning ratio {sparsity_ratio:.4f}")
             if args.prune_method == "wanda":
