@@ -2,8 +2,9 @@ import time
 import heapq 
 import torch 
 import torch.nn as nn 
+from transformers.models.opt.modeling_opt import OPTAttention
 from .sparsegpt import SparseGPT 
-from .layerwrapper import WrappedGPT
+from .layerwrapper import WrappedGPT, QueryOrKeyProjectionLayerWrapper, ValueProjectionLayerWrapper, FullyConnectedLayerWrapper, OutputProjectionLayerWrapper
 from .data import get_loaders 
 
 from .ablate import AblateGPT 
@@ -142,7 +143,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         wrapped_layers = {}
         for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
+            wrapped_layers[name] = WrappedGPT(subset[name], layer_name=name)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -185,7 +186,154 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
+    
+    
+def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+    print("NUM_HEADS:", model.config.num_attention_heads)
+    # model.config.output_attentions = True
 
+    print("loading calibdation data")
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    print("dataset loading complete")
+    with torch.no_grad():
+        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
+
+    layers = model.model.decoder.layers
+    
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+        self_attn_layer = find_layers(layer, layers=[OPTAttention])
+        assert len(self_attn_layer) == 1, "Only one self-attention layer is supported"
+        self_attn_layer = list(self_attn_layer.values())[0]
+        self_attn_layer._attention_weights = None
+
+        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs, attention_mask = inps.to(dev), outs.to(dev), attention_mask.to(dev)
+            
+            
+        def save_attention_weights(module, inp, out):
+            module._attention_weights = out[1]
+        attn_layer_hook_handle = self_attn_layer.register_forward_hook(save_attention_weights)
+
+        wrapped_layers = {}
+        for name in subset:
+            if "k_proj" in name or "q_proj" in name:
+                wrapped_layers[name] = QueryOrKeyProjectionLayerWrapper(subset[name])
+            elif "v_proj" in name:
+                wrapped_layers[name] = ValueProjectionLayerWrapper(subset[name])
+            elif "fc1" in name or "fc2" in name:
+                wrapped_layers[name] = FullyConnectedLayerWrapper(subset[name])
+            elif "out_proj" in name:
+                wrapped_layers[name] = OutputProjectionLayerWrapper(subset[name])
+            else:
+                raise ValueError(f"Layer {name} not supported") 
+                
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, output_attentions=True)[0]
+            assert self_attn_layer._attention_weights is not None, "Attention weights not saved"
+            wrapped_layers["self_attn.v_proj"].update(self_attn_layer._attention_weights)
+            # wrapped_layers["self_attn.v_proj"].update(wrapped_layers["self_attn.out_proj"].input_activations)
+            # wrapped_layers["self_attn.v_proj"].update(
+            #     torch.eye(
+            #         n=self_attn_layer._attention_weights.shape[-1], 
+            #         device=self_attn_layer._attention_weights.device,
+            #     )
+            # )
+            self_attn_layer._attention_weights = None
+            wrapped_layers["self_attn.v_proj"].input_activations = None
+            wrapped_layers["self_attn.out_proj"].input_activations = None
+            
+        for h in handles:
+            h.remove()
+            attn_layer_hook_handle.remove()
+
+        for name in subset:
+            print(f"pruning layer {i} name {name}")
+            if "q_proj" in name:
+                W_metric = (
+                    torch.abs(subset[name].weight.data) 
+                    * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
+                    * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                )
+            elif "k_proj" in name:
+                W_metric = (
+                    torch.abs(subset[name].weight.data) 
+                    * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
+                    * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                )
+            elif "v_proj" in name:
+                W_metric = (
+                    torch.abs(subset[name].weight.data) 
+                    * torch.sqrt(
+                        wrapped_layers[name].average_input_activations_and_attention_weights_sqrd_norm
+                    ).view(1,-1)
+                )
+            elif "fc1" in name or "fc2" in name or "out_proj" in name:
+                W_metric = (
+                    torch.abs(subset[name].weight.data) 
+                    * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1)
+                )
+            else:
+                raise ValueError(f"Layer {name} not supported")
+                
+            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            if prune_n != 0:
+                # structured n:m sparsity
+                raise ValueError("n:m pruning not supported for AESPA")
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:,ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            else:
+                if "k_proj" in name or "q_proj" in name:
+                    print(name, "PRUNING (out, all)")
+                    pruning_threshold = torch.kthvalue(
+                        input=W_metric.flatten(),
+                        k=int(W_metric.numel() * args.sparsity_ratio),
+                    ).values
+                    W_mask = (W_metric <= pruning_threshold)
+                else:
+                    print(name, "PRUNING (out, 1)")
+                    pruning_threshold = torch.kthvalue(
+                        input=W_metric,
+                        dim=1,
+                        k=int(W_metric.shape[1] * args.sparsity_ratio),
+                        keepdim=True,
+                    ).values
+                    W_mask = (W_metric <= pruning_threshold)
+                # pruning_threshold = torch.kthvalue(
+                #     input=W_metric,
+                #     dim=1,
+                #     k=int(W_metric.shape[1] * args.sparsity_ratio),
+                #     keepdim=True,
+                # ).values
+                # W_mask = (W_metric <= pruning_threshold)
+
+            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+    # model.config.output_attentions = False 
+    torch.cuda.empty_cache()
+    
+    
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
