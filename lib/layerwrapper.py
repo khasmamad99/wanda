@@ -55,6 +55,10 @@ class QueryOrKeyProjectionLayerWrapper:
         batch_size, sequence_length, num_in_channels = input_activations.shape
         batch_size, sequence_length, num_out_channels = output_activations.shape
         
+        device = self.average_input_activations_sqrd_norm.device
+        input_activations = input_activations.to(device)
+        output_activations = output_activations.to(device)
+        
         input_activations = input_activations.type(torch.float32)
         output_activations = output_activations.type(torch.float32)
         
