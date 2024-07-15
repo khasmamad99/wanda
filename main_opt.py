@@ -30,7 +30,7 @@ def main():
     parser.add_argument('--model', type=str, help='LLaMA model')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
-    parser.add_argument('--sparsity_ratios', type=float, nargs="+", default=[0.5,], help='Sparsity levels')
+    parser.add_argument('--sparsity_ratios', type=float, nargs="+", default=[], help='Sparsity levels')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "aespa",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
@@ -38,6 +38,7 @@ def main():
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
+    parser.add_argument("--dense", action="store_true", help="whether to use dense model")
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -51,8 +52,24 @@ def main():
     if args.sparsity_type != "unstructured":
         assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
-
+        
     sparsity_ratio_to_perplexity = {}
+    if args.dense:
+        model_name = args.model.split("/")[-1]
+        print(f"loading llm model {args.model}")
+        model = get_llm(args.model, args.cache_dir)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+        device = torch.device("cuda:0")
+        if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+            device = model.hf_device_map["lm_head"]
+        print("use device ", device)
+        
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"wikitext perplexity {ppl_test}")
+        sparsity_ratio_to_perplexity[0] = ppl_test
+
     if len(args.sparsity_ratios) > 0:
         print("pruning starts")
         for sparsity_ratio in args.sparsity_ratios:
@@ -97,6 +114,9 @@ def main():
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
         print("method\tactual_sparsity\tppl_test", file=f, flush=True)
+        if args.dense:
+            print(f"dense\t0.0\t{sparsity_ratio_to_perplexity[0]:.4f}", file=f, flush=True)
+            sparsity_ratio_to_perplexity.pop(0)
         for sparsity_ratio, ppl_test in sparsity_ratio_to_perplexity.items():
             print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
