@@ -221,9 +221,9 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
-    layers = model.model.decoder.layers
+    layers = model.model.layers
     
     for i in range(len(layers)):
         layer = layers[i]
@@ -235,7 +235,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask = inps.to(dev), outs.to(dev), attention_mask.to(dev)
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
             
             
         def save_attention_weights(module, inp, out):
@@ -248,9 +248,9 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 wrapped_layers[name] = QueryOrKeyProjectionLayerWrapper(subset[name])
             elif "v_proj" in name:
                 wrapped_layers[name] = ValueProjectionLayerWrapper(subset[name])
-            elif "fc1" in name or "fc2" in name:
+            elif "mlp" in name:
                 wrapped_layers[name] = FullyConnectedLayerWrapper(subset[name])
-            elif "out_proj" in name:
+            elif "o_proj" in name:
                 wrapped_layers[name] = OutputProjectionLayerWrapper(subset[name])
             else:
                 raise ValueError(f"Layer {name} not supported") 
@@ -265,7 +265,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, output_attentions=True)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, output_attentions=True)[0]
             assert self_attn_layer._attention_weights is not None, "Attention weights not saved"
             wrapped_layers["self_attn.v_proj"].update(self_attn_layer._attention_weights)
             # wrapped_layers["self_attn.v_proj"].update(wrapped_layers["self_attn.out_proj"].input_activations)
@@ -277,7 +277,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             # )
             self_attn_layer._attention_weights = None
             wrapped_layers["self_attn.v_proj"].input_activations = None
-            wrapped_layers["self_attn.out_proj"].input_activations = None
+            wrapped_layers["self_attn.o_proj"].input_activations = None
             
         for h in handles:
             h.remove()
@@ -289,13 +289,13 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
-                    * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                    # * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "k_proj" in name:
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
-                    * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                    # * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "v_proj" in name:
                 W_metric = (
@@ -304,7 +304,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         wrapped_layers[name].average_input_activations_and_attention_weights_sqrd_norm
                     ).view(1,-1)
                 )
-            elif "fc1" in name or "fc2" in name or "out_proj" in name:
+            elif "mlp" in name or "o_proj" in name:
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1)
@@ -321,35 +321,35 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
-                if "k_proj" in name or "q_proj" in name:
-                    print(name, "PRUNING (out, all)")
-                    pruning_threshold = torch.kthvalue(
-                        input=W_metric.flatten(),
-                        k=int(W_metric.numel() * args.sparsity_ratio),
-                    ).values
-                    W_mask = (W_metric <= pruning_threshold)
-                else:
-                    print(name, "PRUNING (out, 1)")
-                    pruning_threshold = torch.kthvalue(
-                        input=W_metric,
-                        dim=1,
-                        k=int(W_metric.shape[1] * args.sparsity_ratio),
-                        keepdim=True,
-                    ).values
-                    W_mask = (W_metric <= pruning_threshold)
-                # pruning_threshold = torch.kthvalue(
-                #     input=W_metric,
-                #     dim=1,
-                #     k=int(W_metric.shape[1] * args.sparsity_ratio),
-                #     keepdim=True,
-                # ).values
-                # W_mask = (W_metric <= pruning_threshold)
+                # if "k_proj" in name or "q_proj" in name:
+                #     print(name, "PRUNING (out, all)")
+                #     pruning_threshold = torch.kthvalue(
+                #         input=W_metric.flatten(),
+                #         k=int(W_metric.numel() * args.sparsity_ratio),
+                #     ).values
+                #     W_mask = (W_metric <= pruning_threshold)
+                # else:
+                #     print(name, "PRUNING (out, 1)")
+                #     pruning_threshold = torch.kthvalue(
+                #         input=W_metric,
+                #         dim=1,
+                #         k=int(W_metric.shape[1] * args.sparsity_ratio),
+                #         keepdim=True,
+                #     ).values
+                #     W_mask = (W_metric <= pruning_threshold)
+                pruning_threshold = torch.kthvalue(
+                    input=W_metric,
+                    dim=1,
+                    k=int(W_metric.shape[1] * args.sparsity_ratio),
+                    keepdim=True,
+                ).values
+                W_mask = (W_metric <= pruning_threshold)
 
             subset[name].weight.data[W_mask] = 0  ## set weights to zero 
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
