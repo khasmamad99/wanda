@@ -58,6 +58,9 @@ class QueryOrKeyProjectionLayerWrapper:
         input_activations = input_activations.type(torch.float32)
         output_activations = output_activations.type(torch.float32)
         
+        input_activations = input_activations.to(self.average_input_activations_sqrd_norm.device)
+        output_activations = output_activations.to(self.average_input_activations_sqrd_norm.device)
+        
         if len(input_activations.shape) == 3:
             input_activations = input_activations.view(-1, num_in_channels)
         if len(output_activations.shape) == 3:
@@ -107,6 +110,9 @@ class ValueProjectionLayerWrapper:
         if len(attention_weights.shape) == 3:
             attention_weights = attention_weights.unsqueeze(0)
         
+        self.input_activations = self.input_activations.to(self.average_input_activations_and_attention_weights_sqrd_norm.device)
+        attention_weights = attention_weights.to(self.average_input_activations_and_attention_weights_sqrd_norm.device)
+        
         self.input_activations = self.input_activations.type(torch.float32)
         attention_weights = attention_weights.type(torch.float32)
         num_heads, batch_size, seq_len, seq_len = attention_weights.shape
@@ -150,6 +156,7 @@ class FullyConnectedLayerWrapper:
         
         if len(input_activations.shape) == 3:
             input_activations = input_activations.view(-1, num_in_channels)
+        input_activations = input_activations.to(self.average_input_activations_sqrd_norm.device)
         
         sum_of_input_activations_sqrd_norms = (
             (self.average_input_activations_sqrd_norm * self.num_samples) 
@@ -180,6 +187,7 @@ class OutputProjectionLayerWrapper:
         input_activations = input_activations.type(torch.float32)
         if len(input_activations.shape) == 3:
             input_activations = input_activations.view(-1, input_activations.shape[-1])
+        input_activations = input_activations.to(self.average_input_activations_sqrd_norm.device)
         
         sum_of_input_activations_sqrd_norms = (
             (self.average_input_activations_sqrd_norm * self.num_samples) 
