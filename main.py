@@ -14,12 +14,15 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights"):
+
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="auto"
+        device_map="auto",
+        token=os.environ.get("HF_TOKEN", None)
     )
 
     model.seqlen = model.config.max_position_embeddings 
@@ -32,7 +35,7 @@ def main():
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratios', type=float, nargs="+", default=[0.5,], help='Sparsity levels')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
+    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "aespa",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -56,11 +59,16 @@ def main():
     if len(args.sparsity_ratios) > 0:
         print("pruning starts")
         for sparsity_ratio in args.sparsity_ratios:
+            args.sparsity_ratio = sparsity_ratio
             model_name = args.model.split("/")[-1]
             print(f"loading llm model {args.model}")
             model = get_llm(args.model, args.cache_dir)
             model.eval()
-            tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.model, 
+                use_fast=False,
+                token=os.environ.get("HF_TOKEN", None)
+            )
 
             device = torch.device("cuda:0")
             if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
