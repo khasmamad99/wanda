@@ -8,6 +8,7 @@ from .layerwrapper import WrappedGPT, QueryOrKeyProjectionLayerWrapper, ValuePro
 from .data import get_loaders 
 
 from .ablate import AblateGPT 
+import os
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -136,6 +137,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
     layers = model.model.layers
+    per_layer_losses = []
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -200,12 +202,38 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+            # original_weights = subset[name].weight.data
+            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].pruned_weights = pruned_weights
+            subset[name].original_weights = subset[name].weight.data
 
+        # for j in range(args.nsamples):
+        #     with torch.no_grad():
+        #         outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        # inps, outs = outs, inps
+        total_loss = 0
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                for name in subset:
+                    subset[name].weight.data = subset[name].pruned_weights
+                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                for name in subset:
+                    subset[name].weight.data = subset[name].original_weights
+        loss = total_loss.item() / args.nsamples
+        per_layer_losses.append(loss)
+        print(f"Layer {i} Loss: {loss}")
         inps, outs = outs, inps
+        
+    # Create the directory if it doesn't exist
+    os.makedirs("layerwise_losses", exist_ok=True)
+
+    # Write the losses to a file
+    with open(f"layerwise_losses/{args.model.replace('/', '--')}_wanda.txt", "w") as f:
+        for loss in per_layer_losses:
+            f.write(str(loss) + "\n")
 
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
@@ -221,10 +249,10 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
-    layers = model.model.decoder.layers
-    
+    layers = model.model.layers
+    per_layer_losses = []
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -235,7 +263,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask = inps.to(dev), outs.to(dev), attention_mask.to(dev)
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev)
             
             
         def save_attention_weights(module, inp, out):
@@ -248,9 +276,9 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 wrapped_layers[name] = QueryOrKeyProjectionLayerWrapper(subset[name])
             elif "v_proj" in name:
                 wrapped_layers[name] = ValueProjectionLayerWrapper(subset[name])
-            elif "fc1" in name or "fc2" in name:
+            elif "mlp" in name:
                 wrapped_layers[name] = FullyConnectedLayerWrapper(subset[name])
-            elif "out_proj" in name:
+            elif "o_proj" in name:
                 wrapped_layers[name] = OutputProjectionLayerWrapper(subset[name])
             else:
                 raise ValueError(f"Layer {name} not supported") 
@@ -265,10 +293,10 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, output_attentions=True)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, output_attentions=True)[0]
             assert self_attn_layer._attention_weights is not None, "Attention weights not saved"
             wrapped_layers["self_attn.v_proj"].update(self_attn_layer._attention_weights)
-            # wrapped_layers["self_attn.v_proj"].update(wrapped_layers["self_attn.out_proj"].input_activations)
+            # wrapped_layers["self_attn.v_proj"].update(wrapped_layers["self_attn.o_proj"].input_activations)
             # wrapped_layers["self_attn.v_proj"].update(
             #     torch.eye(
             #         n=self_attn_layer._attention_weights.shape[-1], 
@@ -277,7 +305,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             # )
             self_attn_layer._attention_weights = None
             wrapped_layers["self_attn.v_proj"].input_activations = None
-            wrapped_layers["self_attn.out_proj"].input_activations = None
+            wrapped_layers["self_attn.o_proj"].input_activations = None
             
         for h in handles:
             h.remove()
@@ -304,7 +332,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         wrapped_layers[name].average_input_activations_and_attention_weights_sqrd_norm
                     ).view(1,-1)
                 )
-            elif "fc1" in name or "fc2" in name or "out_proj" in name:
+            elif "mlp" in name or "o_proj" in name:
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1)
@@ -345,12 +373,34 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 # ).values
                 # W_mask = (W_metric <= pruning_threshold)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
+            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+            # original_weights = subset[name].weight.data
+            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].pruned_weights = pruned_weights
+            subset[name].original_weights = subset[name].weight.data
+        
+        total_loss = 0
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                for name in subset:
+                    subset[name].weight.data = subset[name].pruned_weights
+                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                for name in subset:
+                    subset[name].weight.data = subset[name].original_weights
+        loss = total_loss.item() / args.nsamples
+        per_layer_losses.append(loss)
+        print(f"Layer {i} Loss: {loss}")
         inps, outs = outs, inps
+    
+    # Create the directory if it doesn't exist
+    os.makedirs("layerwise_losses", exist_ok=True)
+
+    # Write the losses to a file
+    with open(f"layerwise_losses/{args.model.replace('/', '--')}_aespa.txt", "w") as f:
+        for loss in per_layer_losses:
+            f.write(str(loss) + "\n")
 
     model.config.use_cache = use_cache
     # model.config.output_attentions = False 
