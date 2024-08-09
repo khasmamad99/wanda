@@ -8,6 +8,7 @@ from .layerwrapper import WrappedGPT, QueryOrKeyProjectionLayerWrapper, ValuePro
 from .data import get_loaders 
 
 from .ablate import AblateGPT 
+import os
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -56,7 +57,7 @@ def check_sparsity(model):
     model.config.use_cache = use_cache 
     return float(count)/total_params 
 
-def prepare_calibration_input(model, dataloader, device):
+def prepare_calibration_input(model, dataloader, device, nsamples=128):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.decoder.layers
@@ -65,7 +66,7 @@ def prepare_calibration_input(model, dataloader, device):
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
@@ -130,9 +131,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device, nsamples=args.nsamples)
 
     layers = model.model.decoder.layers
+    per_layer_losses = []
+    
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -177,12 +180,38 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                 W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+            # original_weights = subset[name].weight.data
+            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].pruned_weights = pruned_weights
+            subset[name].original_weights = subset[name].weight.data
 
+        # for j in range(args.nsamples):
+        #     with torch.no_grad():
+        #         outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        # inps, outs = outs, inps
+        total_loss = 0
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                for name in subset:
+                    subset[name].weight.data = subset[name].pruned_weights
+                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                for name in subset:
+                    subset[name].weight.data = subset[name].original_weights
+        loss = total_loss.item() / args.nsamples
+        per_layer_losses.append(loss)
+        print(f"Layer {i} Loss: {loss}")
         inps, outs = outs, inps
+        
+    # Create the directory if it doesn't exist
+    os.makedirs("layerwise_losses", exist_ok=True)
+
+    # Write the losses to a file
+    with open(f"layerwise_losses/{args.model.replace('/', '--')}_wanda.txt", "w") as f:
+        for loss in per_layer_losses:
+            f.write(str(loss) + "\n")
 
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
@@ -198,10 +227,11 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device, nsamples=args.nsamples)
 
     layers = model.model.decoder.layers
     
+    per_layer_losses = []
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -236,7 +266,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             def tmp(_, inp, out):
                 wrapped_layers[name].add_batch(inp[0].data, out.data)
             return tmp
-
+        
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
@@ -300,34 +330,50 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             else:
                 if "k_proj" in name or "q_proj" in name:
                     print(name, "PRUNING (out, all)")
-                    pruning_threshold = torch.kthvalue(
-                        input=W_metric.flatten(),
-                        k=int(W_metric.numel() * args.sparsity_ratio),
-                    ).values
+                    k = int(W_metric.shape[1] * W_metric.shape[0] * args.sparsity_ratio)
+                    topk_values, _ = torch.topk(W_metric.flatten(), k=k, largest=False)
+                    pruning_threshold = topk_values[-1]
                     W_mask = (W_metric <= pruning_threshold)
                 else:
                     print(name, "PRUNING (out, 1)")
-                    pruning_threshold = torch.kthvalue(
-                        input=W_metric,
-                        dim=1,
-                        k=int(W_metric.shape[1] * args.sparsity_ratio),
-                        keepdim=True,
-                    ).values
+                    k = int(W_metric.shape[1] * args.sparsity_ratio)
+                    topk_values, _ = torch.topk(W_metric, k=k, dim=1, largest=False)
+                    pruning_threshold = topk_values[:, -1].unsqueeze(1)
                     W_mask = (W_metric <= pruning_threshold)
-                # pruning_threshold = torch.kthvalue(
-                #     input=W_metric,
-                #     dim=1,
-                #     k=int(W_metric.shape[1] * args.sparsity_ratio),
-                #     keepdim=True,
-                # ).values
+                    
+                # k = int(W_metric.shape[1] * args.sparsity_ratio)
+                # topk_values, _ = torch.topk(W_metric, k=k, dim=1, largest=False)
+                # pruning_threshold = topk_values[:, -1].unsqueeze(1)
                 # W_mask = (W_metric <= pruning_threshold)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
+            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+            # original_weights = subset[name].weight.data
+            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].pruned_weights = pruned_weights
+            subset[name].original_weights = subset[name].weight.data
+        
+        total_loss = 0
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                for name in subset:
+                    subset[name].weight.data = subset[name].pruned_weights
+                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                for name in subset:
+                    subset[name].weight.data = subset[name].original_weights
+        loss = total_loss.item() / args.nsamples
+        per_layer_losses.append(loss)
+        print(f"Layer {i} Loss: {loss}")
         inps, outs = outs, inps
+    
+    # Create the directory if it doesn't exist
+    os.makedirs("layerwise_losses", exist_ok=True)
+
+    # Write the losses to a file
+    with open(f"layerwise_losses/{args.model.replace('/', '--')}_aespa.txt", "w") as f:
+        for loss in per_layer_losses:
+            f.write(str(loss) + "\n")
 
     model.config.use_cache = use_cache
     # model.config.output_attentions = False 
