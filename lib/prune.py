@@ -317,13 +317,13 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
-                    # * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                    * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "k_proj" in name:
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
-                    # * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
+                    * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "v_proj" in name:
                 W_metric = (
@@ -349,29 +349,29 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
-                # if "k_proj" in name or "q_proj" in name:
-                #     print(name, "PRUNING (out, all)")
-                #     pruning_threshold = torch.kthvalue(
-                #         input=W_metric.flatten(),
-                #         k=int(W_metric.numel() * args.sparsity_ratio),
-                #     ).values
-                #     W_mask = (W_metric <= pruning_threshold)
-                # else:
-                #     print(name, "PRUNING (out, 1)")
-                #     pruning_threshold = torch.kthvalue(
-                #         input=W_metric,
-                #         dim=1,
-                #         k=int(W_metric.shape[1] * args.sparsity_ratio),
-                #         keepdim=True,
-                #     ).values
-                #     W_mask = (W_metric <= pruning_threshold)
-                pruning_threshold = torch.kthvalue(
-                    input=W_metric,
-                    dim=1,
-                    k=int(W_metric.shape[1] * args.sparsity_ratio),
-                    keepdim=True,
-                ).values
-                W_mask = (W_metric <= pruning_threshold)
+                if "k_proj" in name or "q_proj" in name:
+                    print(name, "PRUNING (out, all)")
+                    pruning_threshold = torch.kthvalue(
+                        input=W_metric.flatten(),
+                        k=int(W_metric.numel() * args.sparsity_ratio),
+                    ).values
+                    W_mask = (W_metric <= pruning_threshold)
+                else:
+                    print(name, "PRUNING (out, 1)")
+                    pruning_threshold = torch.kthvalue(
+                        input=W_metric,
+                        dim=1,
+                        k=int(W_metric.shape[1] * args.sparsity_ratio),
+                        keepdim=True,
+                    ).values
+                    W_mask = (W_metric <= pruning_threshold)
+                # pruning_threshold = torch.kthvalue(
+                #     input=W_metric,
+                #     dim=1,
+                #     k=int(W_metric.shape[1] * args.sparsity_ratio),
+                #     keepdim=True,
+                # ).values
+                # W_mask = (W_metric <= pruning_threshold)
 
             pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
             # original_weights = subset[name].weight.data
