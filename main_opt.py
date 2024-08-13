@@ -109,16 +109,18 @@ def main():
             print(f"wikitext perplexity {ppl_test}")
             sparsity_ratio_to_perplexity[sparsity_ratio] = ppl_test
 
-    if not os.path.exists(args.save):
-        os.makedirs(args.save)
-    save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
-    with open(save_filepath, "w") as f:
-        print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        if args.dense:
-            print(f"dense\t0.0\t{sparsity_ratio_to_perplexity[0]:.4f}", file=f, flush=True)
-            sparsity_ratio_to_perplexity.pop(0)
-        for sparsity_ratio, ppl_test in sparsity_ratio_to_perplexity.items():
-            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+    
+    if args.save is not None:
+        if not os.path.exists(args.save):
+            os.makedirs(args.save)
+        save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
+        with open(save_filepath, "w") as f:
+            print("method\tactual_sparsity\tppl_test", file=f, flush=True)
+            if args.dense:
+                print(f"dense\t0.0\t{sparsity_ratio_to_perplexity[0]:.4f}", file=f, flush=True)
+                sparsity_ratio_to_perplexity.pop(0)
+            for sparsity_ratio, ppl_test in sparsity_ratio_to_perplexity.items():
+                print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False
