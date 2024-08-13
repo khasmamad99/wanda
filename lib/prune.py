@@ -126,7 +126,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, log_layerwise_losses=False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -215,11 +215,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         total_loss = 0
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
                 for name in subset:
                     subset[name].weight.data = subset[name].pruned_weights
-                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                with torch.autocast(device_type="cuda", dtype=torch.float32):
+                    total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
                 for name in subset:
                     subset[name].weight.data = subset[name].original_weights
         loss = total_loss.item() / args.nsamples
@@ -386,7 +387,8 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 for name in subset:
                     subset[name].weight.data = subset[name].pruned_weights
                 pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                with torch.autocast(device_type="cuda", dtype=torch.float32):
+                    total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
                 for name in subset:
                     subset[name].weight.data = subset[name].original_weights
         loss = total_loss.item() / args.nsamples
