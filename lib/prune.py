@@ -325,7 +325,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, output_attentions=True)[0]
             assert self_attn_layer._attention_weights is not None, "Attention weights not saved"
             wrapped_layers["self_attn.v_proj"].update(self_attn_layer._attention_weights)
-            # wrapped_layers["self_attn.v_proj"].update(wrapped_layers["self_attn.o_proj"].input_activations)
+            # Comment the above line and uncomment the following line to use the identity matrix as the attention weights
             # wrapped_layers["self_attn.v_proj"].update(
             #     torch.eye(
             #         n=self_attn_layer._attention_weights.shape[-1], 
@@ -346,12 +346,14 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
+                    # comment the following line to ignore the effect of Key value matrix
                     * torch.sqrt(wrapped_layers["self_attn.k_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "k_proj" in name:
                 W_metric = (
                     torch.abs(subset[name].weight.data) 
                     * torch.sqrt(wrapped_layers[name].average_input_activations_sqrd_norm).view(1,-1) 
+                    # comment the following line to ignore the effect of Query value matrix
                     * torch.sqrt(wrapped_layers["self_attn.q_proj"].average_output_activations_sqrd_norm).view(-1,1)
                 )
             elif "v_proj" in name:
@@ -379,7 +381,8 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
                 if "k_proj" in name or "q_proj" in name:
-                    comparison_group_size = 128
+                    # change the comparison group size by adjusting the following value
+                    comparison_group_size = -1
                     out_channels, in_channels = W_metric.shape
                     
                     if comparison_group_size == -1:
@@ -405,13 +408,6 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         keepdim=True,
                     ).values
                     W_mask = (W_metric <= pruning_threshold)
-                # pruning_threshold = torch.kthvalue(
-                #     input=W_metric,
-                #     dim=1,
-                #     k=int(W_metric.shape[1] * args.sparsity_ratio),
-                #     keepdim=True,
-                # ).values
-                # W_mask = (W_metric <= pruning_threshold)
 
             if not log_layerwise_losses and not log_layerwise_perplexities:
                 subset[name].weight.data[W_mask] = 0  ## set weights to zero 
