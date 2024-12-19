@@ -6,6 +6,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT, QueryOrKeyProjectionLayerWrapper, ValueProjectionLayerWrapper, FullyConnectedLayerWrapper, OutputProjectionLayerWrapper
 from .data import get_loaders 
+from lib.eval import eval_ppl
 
 from .ablate import AblateGPT 
 import os
@@ -57,7 +58,7 @@ def check_sparsity(model):
     model.config.use_cache = use_cache 
     return float(count)/total_params 
 
-def prepare_calibration_input(model, dataloader, device):
+def prepare_calibration_input(model, dataloader, device, nsamples=128):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
@@ -67,7 +68,7 @@ def prepare_calibration_input(model, dataloader, device):
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
@@ -126,7 +127,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, log_layerwise_losses=False):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, log_layerwise_losses=False, log_layerwise_perplexities=False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -134,10 +135,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device, args.nsamples)
 
     layers = model.model.layers
     per_layer_losses = []
+    per_layer_perplexities = []
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -202,45 +204,70 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
-            # original_weights = subset[name].weight.data
-            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-            subset[name].pruned_weights = pruned_weights
-            subset[name].original_weights = subset[name].weight.data
+            if not log_layerwise_losses and not log_layerwise_perplexities:
+                subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            else: 
+                pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+                subset[name].pruned_weights = pruned_weights
+                subset[name].original_weights = subset[name].weight.data
 
-        # for j in range(args.nsamples):
-        #     with torch.no_grad():
-        #         outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        # inps, outs = outs, inps
-        total_loss = 0
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                for name in subset:
-                    subset[name].weight.data = subset[name].pruned_weights
-                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                with torch.autocast(device_type="cuda", dtype=torch.float32):
-                    total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
-                for name in subset:
-                    subset[name].weight.data = subset[name].original_weights
-        loss = total_loss.item() / args.nsamples
-        per_layer_losses.append(loss)
-        print(f"Layer {i} Loss: {loss}")
-        inps, outs = outs, inps
+        if not log_layerwise_losses:
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        else:
+            total_loss = 0
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    for name in subset:
+                        subset[name].weight.data = subset[name].pruned_weights
+                    pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    with torch.autocast(device_type="cuda", dtype=torch.float32):
+                        total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                    for name in subset:
+                        subset[name].weight.data = subset[name].original_weights
+                        
+            loss = total_loss.item() / args.nsamples
+            per_layer_losses.append(loss)
+            
+        if log_layerwise_perplexities:
+            # eval model
+            for name in subset:
+                subset[name].weight.data = subset[name].pruned_weights
+            perplexity = eval_ppl(args, model, tokenizer, device)
+            for name in subset:
+                subset[name].weight.data = subset[name].original_weights                
         
-    # Create the directory if it doesn't exist
-    os.makedirs("layerwise_losses", exist_ok=True)
+            per_layer_perplexities.append(perplexity)
+            print(f"Layer {i}: ppl = {perplexity}")
+                
+        inps, outs = outs, inps
+                            
+    if log_layerwise_losses:
+        # Create the directory if it doesn't exist
+        os.makedirs("layerwise_losses", exist_ok=True)
 
-    # Write the losses to a file
-    with open(f"layerwise_losses/{args.model.replace('/', '--')}_wanda.txt", "w") as f:
-        for loss in per_layer_losses:
-            f.write(str(loss) + "\n")
+        # Write the losses to a file
+        with open(f"layerwise_losses/{args.model.replace('/', '--')}_wanda.txt", "w") as f:
+            for loss in per_layer_losses:
+                f.write(str(loss) + "\n")
+                
+    if log_layerwise_perplexities:
+        # Create the directory if it doesn't exist
+        os.makedirs("layerwise_perplexities", exist_ok=True)
 
+        # Write the perplexities to a file
+        with open(f"layerwise_perplexities/{args.model.replace('/', '--')}_wanda.txt", "w") as f:
+            for perplexity in per_layer_perplexities:
+                f.write(str(perplexity) + "\n")
+                    
+        
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
     
     
-def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, log_layerwise_losses=False, log_layerwise_perplexities=False):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
     print("NUM_HEADS:", model.config.num_attention_heads)
@@ -250,10 +277,11 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device, nsamples=args.nsamples)
 
     layers = model.model.layers
     per_layer_losses = []
+    per_layer_perplexities = []
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -351,12 +379,23 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
                 if "k_proj" in name or "q_proj" in name:
-                    print(name, "PRUNING (out, all)")
-                    pruning_threshold = torch.kthvalue(
-                        input=W_metric.flatten(),
-                        k=int(W_metric.numel() * args.sparsity_ratio),
-                    ).values
+                    comparison_group_size = 128
+                    out_channels, in_channels = W_metric.shape
+                    
+                    if comparison_group_size == -1:
+                        comparison_group_size = out_channels
+                    
+                    assert out_channels % comparison_group_size == 0, (
+                        f"out_channels ({out_channels})  must be divisible by comparison_group_size ({comparison_group_size})"
+                    )
+                    
+                    W_metric = W_metric.view(out_channels // comparison_group_size, comparison_group_size * in_channels)
+                    print(name, f"PRUNING (out, {comparison_group_size})")
+                    k = int(W_metric.shape[1] * args.sparsity_ratio)
+                    topk_values, _ = torch.topk(W_metric, k=k, dim=1, largest=False)
+                    pruning_threshold = topk_values[:, -1].unsqueeze(1)
                     W_mask = (W_metric <= pruning_threshold)
+                    W_mask = W_mask.reshape(out_channels, in_channels)
                 else:
                     print(name, "PRUNING (out, 1)")
                     pruning_threshold = torch.kthvalue(
@@ -374,36 +413,62 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 # ).values
                 # W_mask = (W_metric <= pruning_threshold)
 
-            pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
-            # original_weights = subset[name].weight.data
-            # subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-            subset[name].pruned_weights = pruned_weights
-            subset[name].original_weights = subset[name].weight.data
+            if not log_layerwise_losses and not log_layerwise_perplexities:
+                subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            else:
+                pruned_weights = subset[name].weight.data * torch.logical_not(W_mask)
+                subset[name].pruned_weights = pruned_weights
+                subset[name].original_weights = subset[name].weight.data
+                
+        if not log_layerwise_losses:
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        else:
+            total_loss = 0
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    for name in subset:
+                        subset[name].weight.data = subset[name].pruned_weights
+                    pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    with torch.autocast(device_type="cuda", dtype=torch.float32):
+                        total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
+                    for name in subset:
+                        subset[name].weight.data = subset[name].original_weights
+                        
+        if log_layerwise_perplexities:
+            # eval model
+            for name in subset:
+                subset[name].weight.data = subset[name].pruned_weights
+            perplexity = eval_ppl(args, model, tokenizer, device)
+            for name in subset:
+                subset[name].weight.data = subset[name].original_weights                
         
-        total_loss = 0
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                for name in subset:
-                    subset[name].weight.data = subset[name].pruned_weights
-                pruned_outs = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                with torch.autocast(device_type="cuda", dtype=torch.float32):
-                    total_loss += torch.nn.functional.mse_loss(pruned_outs.squeeze(0), outs[j], reduction="mean")
-                for name in subset:
-                    subset[name].weight.data = subset[name].original_weights
-        loss = total_loss.item() / args.nsamples
-        per_layer_losses.append(loss)
-        print(f"Layer {i} Loss: {loss}")
+            per_layer_perplexities.append(perplexity)
+            print(f"Layer {i}: ppl = {perplexity}")
+
         inps, outs = outs, inps
+        
+    if log_layerwise_losses:
+        # Create the directory if it doesn't exist
+        os.makedirs("layerwise_losses", exist_ok=True)
+
+        # Write the losses to a file
+        with open(f"layerwise_losses/{args.model.replace('/', '--')}_aespa.txt", "w") as f:
+            for loss in per_layer_losses:
+                f.write(str(loss) + "\n")
     
-    # Create the directory if it doesn't exist
-    os.makedirs("layerwise_losses", exist_ok=True)
+    if log_layerwise_perplexities:
+        # Create the directory if it doesn't exist
+        os.makedirs("layerwise_perplexities", exist_ok=True)
 
-    # Write the losses to a file
-    with open(f"layerwise_losses/{args.model.replace('/', '--')}_aespa.txt", "w") as f:
-        for loss in per_layer_losses:
-            f.write(str(loss) + "\n")
-
+        # Write the perplexities to a file
+        with open(f"layerwise_perplexities/{args.model.replace('/', '--')}_aespa.txt", "w") as f:
+            for perplexity in per_layer_perplexities:
+                f.write(str(perplexity) + "\n")
+    
+    
     model.config.use_cache = use_cache
     # model.config.output_attentions = False 
     torch.cuda.empty_cache()

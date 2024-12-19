@@ -13,7 +13,7 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
-def get_llm(model_name, cache_dir="llm_weights"):
+def get_llm(model_name, cache_dir=None):
 
     
     model = AutoModelForCausalLM.from_pretrained(
@@ -23,7 +23,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
         low_cpu_mem_usage=True, 
         device_map="auto",
         token=os.environ["HF_TOKEN"],
-        attn_implementation="eager"
+        attn_implementation="eager",
+        # accelerator="auto",
     )
 
     model.seqlen = model.config.max_position_embeddings 
@@ -44,6 +45,8 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument("--dense", action="store_true", help="whether to use dense model")
     parser.add_argument("--log_layerwise_losses", action="store_true", help="whether to log layerwise losses")
+    parser.add_argument("--log_layerwise_perplexities", action="store_true", help="whether to log layerwise perplexities")
+    
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -99,9 +102,9 @@ def main():
             if args.sparsity_ratio != 0:
                 print("pruning starts")
                 if args.prune_method == "wanda":
-                    prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+                    prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, log_layerwise_losses=args.log_layerwise_losses, log_layerwise_perplexities=args.log_layerwise_perplexities)
                 elif args.prune_method == "aespa":
-                    prune_aespa(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+                    prune_aespa(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, log_layerwise_losses=args.log_layerwise_losses, log_layerwise_perplexities=args.log_layerwise_perplexities)
                 elif args.prune_method == "magnitude":
                     prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
                 elif args.prune_method == "sparsegpt":
@@ -119,7 +122,7 @@ def main():
                 print(f"wikitext perplexity {ppl_test}")
                 sparsity_ratio_to_perplexity[sparsity_ratio] = ppl_test
 
-    if args.save is not None:
+    if args.save is not None and len(sparsity_ratio_to_perplexity) > 0 and not args.log_layerwise_losses:
         if not os.path.exists(args.save):
             os.makedirs(args.save)
         save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")

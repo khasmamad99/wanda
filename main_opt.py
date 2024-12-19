@@ -39,6 +39,9 @@ def main():
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument("--dense", action="store_true", help="whether to use dense model")
+    parser.add_argument("--log_layerwise_losses", action="store_true", help="whether to log layerwise losses")
+    parser.add_argument("--log_layerwise_perplexities", action="store_true", help="whether to log layerwise perplexities")
+    
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -89,9 +92,9 @@ def main():
             args.sparsity_ratio = sparsity_ratio
             print(f"pruning ratio {sparsity_ratio:.4f}")
             if args.prune_method == "wanda":
-                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, log_layerwise_losses=args.log_layerwise_losses, log_layerwise_perplexities=args.log_layerwise_perplexities)
             elif args.prune_method == "aespa":
-                prune_aespa(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+                prune_aespa(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, log_layerwise_losses=args.log_layerwise_losses, log_layerwise_perplexities=args.log_layerwise_perplexities)
             elif args.prune_method == "magnitude":
                 prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
             elif args.prune_method == "sparsegpt":
