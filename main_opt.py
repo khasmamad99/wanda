@@ -49,11 +49,35 @@ def main():
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
+    
+    results = {}
+    if args.eval_dense:
+        print("Evaluating dense model")
+        model = get_llm(args.model, args.cache_dir)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+        device = torch.device("cuda:0")
+        if "30b" in args.model or "66b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+            device = model.hf_device_map["lm_head"]
+        print("use device ", device)
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"dense wikitext perplexity {ppl_test}")
+        results["dense"] = ppl_test
+        if args.eval_dense_only:
+            return
+
+    assert len(args.sparsity_ratios) > 0, "sparsity ratio must be provided"
+    assert all([sparsity_ratio > 0 and sparsity_ratio < 1 for sparsity_ratio in args.sparsity_ratios]), "sparsity ratio must be greater than 0"
 
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
-    if args.sparsity_type != "unstructured":
-        assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+    if args.sparsity_type == "unstructured":
+        args.group_sizes = [0]
+    elif args.sparsity_type != "unstructured" and args.sparsity_type != "groupwise":
+        print("N:M sparsity is selected. Setting sparsity ratio to 0.5 for structured N:M sparsity")
+        args.sparsity_ratios = [0.5]
+        args.group_sizes = [0]
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
         
     sparsity_ratio_to_perplexity = {}
@@ -137,9 +161,7 @@ def main():
         print("zero_shot evaluation results")
         print(results)
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+
 
 if __name__ == '__main__':
     main()

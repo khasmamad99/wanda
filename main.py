@@ -54,12 +54,22 @@ def main():
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
+    
+    assert len(args.sparsity_ratios) > 0, "sparsity ratio must be provided"
+    assert all([sparsity_ratio > 0 and sparsity_ratio < 1 for sparsity_ratio in args.sparsity_ratios]), "sparsity ratio must be greater than 0"
 
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
-    if args.sparsity_type != "unstructured":
-        assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+    if args.sparsity_type == "unstructured":
+        args.group_sizes = [0]
+    elif args.sparsity_type != "unstructured" and args.sparsity_type != "groupwise":
+        print("N:M sparsity is selected. Setting sparsity ratio to 0.5 for structured N:M sparsity")
+        args.sparsity_ratios = [0.5]
+        args.group_sizes = [0]
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
+    elif args.sparsity_type == "groupwise":
+        assert all([group_size > 0 for group_size in args.group_sizes]), "group size must be greater than 0 for groupwise sparsity"
+        print(f"Using groupwise pruning with group sizes of {args.group_sizes}")
 
     sparsity_ratio_to_perplexity = {}
     if args.dense:
@@ -144,9 +154,6 @@ def main():
             print("zero_shot evaluation results")
             print(results)
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
-
+    
 if __name__ == '__main__':
     main()

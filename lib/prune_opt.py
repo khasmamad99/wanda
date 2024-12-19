@@ -102,7 +102,7 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     cur_sparsity = (W_mask==True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
 
-def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, group_size=0):
     layers = model.model.decoder.layers 
 
     for i in range(len(layers)):
@@ -113,16 +113,21 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
             W = subset[name].weight.data 
             W_metric = torch.abs(W)
             if prune_n != 0:
+                assert prune_m > prune_n, "prune_m must be greater than prune_n"
+                assert group_size == 0, "group_size must be 0 for n:m sparsity"
                 W_mask = (torch.zeros_like(W)==1)
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            elif group_size > 0:
+                W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
             else:
                 thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
                 W_mask = (W_metric<=thresh)
 
             W[W_mask] = 0
+            
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, log_layerwise_losses=False, log_layerwise_perplexities=False):
     use_cache = model.config.use_cache 
@@ -171,10 +176,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
                 # structured n:m sparsity
+                assert prune_m > prune_n, "prune_m must be greater than prune_n"
+                assert group_size == 0, "group_size must be 0 for n:m sparsity"
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            elif group_size > 0:
+                W_mask = prepare_groupwise_pruning_mask_faster(W_metric, group_size=group_size, sparsity_ratio=args.sparsity_ratio)
             else:
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
@@ -448,7 +457,7 @@ def prune_aespa(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     
     
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
+def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, group_size=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
@@ -501,7 +510,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
         gpts = {}
         for name in subset:
-            gpts[name] = SparseGPT(subset[name])
+            gpts[name] = SparseGPT(subset[name], groupwise=group_size > 0)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -521,7 +530,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             print(i, name)
             print('Pruning ...')
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128, group_size=group_size)
             gpts[name].free()
 
         for j in range(args.nsamples):

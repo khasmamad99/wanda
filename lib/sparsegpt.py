@@ -2,6 +2,7 @@ import math
 import time
 
 import torch
+import torch.nn.functional
 import torch.nn as nn
 import transformers
 
@@ -11,7 +12,7 @@ torch.backends.cudnn.allow_tf32 = False
 ## SparseGPT: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
 class SparseGPT:
 
-    def __init__(self, layer):
+    def __init__(self, layer, groupwise=False):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
@@ -23,6 +24,7 @@ class SparseGPT:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
+        self.groupwise = groupwise
 
     def add_batch(self, inp, out):
         if len(inp.shape) == 2:
@@ -38,7 +40,7 @@ class SparseGPT:
         self.H += inp.matmul(inp.t())
 
     def fasterprune(
-        self, sparsity, prune_n=0, prune_m=0, blocksize=128, percdamp=.01
+        self, sparsity, prune_n=0, prune_m=0, blocksize=128, percdamp=.01, group_size=0,
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -46,7 +48,6 @@ class SparseGPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         W = W.float()
-
         tick = time.time()
 
         H = self.H
@@ -82,13 +83,28 @@ class SparseGPT:
                     mask1 = mask[:, i1:i2]
                 else:
                     tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
-                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
-                    mask1 = tmp <= thresh
+                    if group_size == 0:
+                        thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+                        mask1 = tmp <= thresh
+                    else:
+                        padding_value = -tmp.shape[1] % group_size
+                        padded_tmp = torch.nn.functional.pad(tmp, pad=(0, 0, 0, padding_value), mode="constant", value=0.)
+                        unfolded_tmp = padded_tmp.unfold(1, group_size, group_size) # -> (output_channels, num_groups, group_size)
+                        group_sums = unfolded_tmp.sum(dim=-1) # -> (output_channels, num_groups)
+                        total_num_groups = group_sums.shape[0] * group_sums.shape[1]
+                        num_groups_to_prune = int(total_num_groups * sparsity)
+                        pruning_threshold = torch.kthvalue(
+                            input=group_sums.flatten(), k=num_groups_to_prune
+                        ).values
+                        mask1 = group_sums <= pruning_threshold
+                        mask1 = mask1.repeat_interleave(repeats=group_size, dim=1)
+                        mask1 = mask1.narrow(dim=1, start=0, length=tmp.shape[1])
+                    
             else:
                 mask1 = torch.zeros_like(W1) == 1
 
             for i in range(count):
-                w = W1[:, i]
+                w = W1[:, i]  
                 d = Hinv1[i, i]
 
                 if prune_n != 0 and i % prune_m == 0:
@@ -113,6 +129,10 @@ class SparseGPT:
         torch.cuda.synchronize()
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
+        
+        # if group_size > 0:
+        #     # change from input to output
+        #     W = W.T
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
     def free(self):
