@@ -5,7 +5,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_aespa
+from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, prune_aespa
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -63,7 +63,6 @@ def main():
 
     sparsity_ratio_to_perplexity = {}
     if args.dense:
-        model_name = args.model.split("/")[-1]
         print(f"loading llm model {args.model}")
         model = get_llm(args.model, args.cache_dir)
         model.eval()
@@ -82,7 +81,6 @@ def main():
         print("pruning starts")
         for sparsity_ratio in args.sparsity_ratios:
             args.sparsity_ratio = sparsity_ratio
-            model_name = args.model.split("/")[-1]
             print(f"loading llm model {args.model}")
             model = get_llm(args.model, args.cache_dir)
             model.eval()
